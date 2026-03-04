@@ -28,7 +28,8 @@ export async function deriveRelayToken(gatewayToken, port) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export async function buildRelayWsUrl(port, gatewayToken) {
+export async function buildRelayWsUrl(host, port, gatewayToken) {
+  const relayHost = String(host || "127.0.0.1").trim();
   const token = String(gatewayToken || "").trim();
   if (!token) {
     throw new Error(
@@ -36,7 +37,7 @@ export async function buildRelayWsUrl(port, gatewayToken) {
     );
   }
   const relayToken = await deriveRelayToken(token, port);
-  return `ws://127.0.0.1:${port}/extension?token=${encodeURIComponent(relayToken)}`;
+  return `ws://${relayHost}:${port}/extension?token=${encodeURIComponent(relayToken)}`;
 }
 
 export function isRetryableReconnectError(err) {

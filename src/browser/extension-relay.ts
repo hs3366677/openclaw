@@ -682,7 +682,13 @@ export async function ensureChromeExtensionRelayServer(opts: {
       const pathname = url.pathname;
       const remote = req.socket.remoteAddress;
 
-      if (!isLoopbackAddress(remote)) {
+      // Allow loopback and Docker bridge/NAT networks (172.x.x.x) for
+      // containerised gateways where the Chrome extension connects via
+      // Docker port-mapping.
+      const isAllowedRemote =
+        isLoopbackAddress(remote) ||
+        (typeof remote === "string" && /^(::ffff:)?172\./.test(remote));
+      if (!isAllowedRemote) {
         rejectUpgrade(socket, 403, "Forbidden");
         return;
       }
@@ -962,7 +968,10 @@ export async function ensureChromeExtensionRelayServer(opts: {
 
     try {
       await new Promise<void>((resolve, reject) => {
-        server.listen(info.port, info.host, () => resolve());
+        // Bind to 0.0.0.0 so Docker port-mapping can reach the relay from the host.
+        // Auth + token checks still protect against unauthorised access.
+        const bindHost = process.env.OPENCLAW_RELAY_BIND ?? info.host;
+        server.listen(info.port, bindHost, () => resolve());
         server.once("error", reject);
       });
     } catch (err) {

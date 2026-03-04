@@ -49,6 +49,12 @@ function nowStack() {
   }
 }
 
+async function getRelayHost() {
+  const stored = await chrome.storage.local.get(['relayHost'])
+  const h = String(stored.relayHost || '').trim()
+  return h || '127.0.0.1'
+}
+
 async function getRelayPort() {
   const stored = await chrome.storage.local.get(['relayPort'])
   const raw = stored.relayPort
@@ -132,10 +138,11 @@ async function ensureRelayConnection() {
   if (relayConnectPromise) return await relayConnectPromise
 
   relayConnectPromise = (async () => {
+    const host = await getRelayHost()
     const port = await getRelayPort()
     const gatewayToken = await getGatewayToken()
-    const httpBase = `http://127.0.0.1:${port}`
-    const wsUrl = await buildRelayWsUrl(port, gatewayToken)
+    const httpBase = `http://${host}:${port}`
+    const wsUrl = await buildRelayWsUrl(host, port, gatewayToken)
 
     // Fast preflight: is the relay server up?
     try {

@@ -9,7 +9,7 @@ import type { ChannelManager } from "./server-channels.js";
 
 const log = createSubsystemLogger("gateway/health-monitor");
 
-const DEFAULT_CHECK_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_CHECK_INTERVAL_MS = 10 * 60_000;
 const DEFAULT_MONITOR_STARTUP_GRACE_MS = 60_000;
 const DEFAULT_COOLDOWN_CYCLES = 2;
 const DEFAULT_MAX_RESTARTS_PER_HOUR = 10;
