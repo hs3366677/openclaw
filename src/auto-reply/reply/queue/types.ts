@@ -80,6 +80,8 @@ export type FollowupRun = {
     extraSystemPrompt?: string;
     enforceFinalTag?: boolean;
   };
+  /** Tracks how many times this run has been auto-retried after recoverable errors. */
+  errorRetryCount?: number;
 };
 
 export type ResolveQueueSettingsParams = {

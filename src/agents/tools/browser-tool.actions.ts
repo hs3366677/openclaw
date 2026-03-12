@@ -169,7 +169,12 @@ export async function executeSnapshotAction(params: {
         profile,
       });
   if (snapshot.format === "ai") {
-    const extractedText = snapshot.snapshot ?? "";
+    // Strip lone surrogates that break JSON serialisation for LLM APIs.
+    // eslint-disable-next-line no-control-regex
+    const extractedText = (snapshot.snapshot ?? "").replace(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+      "\uFFFD",
+    );
     const wrappedSnapshot = wrapExternalContent(extractedText, {
       source: "browser",
       includeWarning: true,

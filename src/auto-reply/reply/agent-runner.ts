@@ -359,6 +359,25 @@ export async function runReplyAgent(params: {
     });
 
     if (runOutcome.kind === "final") {
+      const MAX_ERROR_RETRIES = 2;
+      const currentRetryCount = followupRun.errorRetryCount ?? 0;
+      if (
+        runOutcome.retryable &&
+        currentRetryCount < MAX_ERROR_RETRIES &&
+        !isHeartbeat
+      ) {
+        // Schedule auto-retry via followup queue
+        const retryRun: FollowupRun = {
+          ...followupRun,
+          errorRetryCount: currentRetryCount + 1,
+          enqueuedAt: Date.now(),
+          messageId: undefined, // Clear to avoid dedup blocking the retry
+        };
+        enqueueFollowupRun(queueKey, retryRun, resolvedQueue, "none");
+        // Notify user about error and auto-retry
+        const retryNotice = `${runOutcome.payload.text ?? "⚠️ 任务出错"}\n\n🔄 正在自动重试... (${currentRetryCount + 1}/${MAX_ERROR_RETRIES})`;
+        return finalizeWithFollowup({ text: retryNotice }, queueKey, runFollowupTurn);
+      }
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
@@ -472,7 +491,36 @@ export async function runReplyAgent(params: {
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
     // keep the typing indicator stuck.
     if (payloadArray.length === 0) {
+      // Notify user when the run was aborted with no output
+      if (runResult.meta?.aborted) {
+        return finalizeWithFollowup({ text: "⚠️ 任务已被中止。" }, queueKey, runFollowupTurn);
+      }
       return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+    }
+
+    // Auto-retry for error payloads from the embedded run (retry_limit, timeout, etc.)
+    const embeddedError = runResult.meta?.error;
+    const hasOnlyErrorPayloads = payloadArray.every((p) => p.isError);
+    if (
+      embeddedError &&
+      hasOnlyErrorPayloads &&
+      !runResult.meta?.aborted &&
+      !isHeartbeat
+    ) {
+      const MAX_ERROR_RETRIES = 2;
+      const currentRetryCount = followupRun.errorRetryCount ?? 0;
+      if (currentRetryCount < MAX_ERROR_RETRIES) {
+        const retryRun: FollowupRun = {
+          ...followupRun,
+          errorRetryCount: currentRetryCount + 1,
+          enqueuedAt: Date.now(),
+          messageId: undefined,
+        };
+        enqueueFollowupRun(queueKey, retryRun, resolvedQueue, "none");
+        const errorText = payloadArray.map((p) => p.text).join("\n") || "⚠️ 任务出错";
+        const retryNotice = `${errorText}\n\n🔄 正在自动重试... (${currentRetryCount + 1}/${MAX_ERROR_RETRIES})`;
+        return finalizeWithFollowup({ text: retryNotice }, queueKey, runFollowupTurn);
+      }
     }
 
     const payloadResult = buildReplyPayloads({
@@ -695,9 +743,14 @@ export async function runReplyAgent(params: {
       runFollowupTurn,
     );
   } catch (error) {
-    // Keep the followup queue moving even when an unexpected exception escapes
-    // the run path; the caller still receives the original error.
-    finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+    // Notify user about unexpected errors so they don't see a silent failure.
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const safeError = errorMessage.length > 200 ? `${errorMessage.slice(0, 200)}…` : errorMessage;
+    finalizeWithFollowup(
+      { text: `⚠️ 任务异常终止: ${safeError}` },
+      queueKey,
+      runFollowupTurn,
+    );
     throw error;
   } finally {
     blockReplyPipeline?.stop();

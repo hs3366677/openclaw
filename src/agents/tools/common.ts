@@ -227,12 +227,24 @@ export function readReactionParams(
   return { emoji, remove, isEmpty: !emoji };
 }
 
+/**
+ * Strip lone surrogates (\uD800-\uDFFF not part of a valid pair) from a string.
+ * These cause "Bad Unicode escape in JSON" errors when the text is later
+ * serialised and sent to LLM APIs.
+ */
+function stripLoneSurrogates(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
+}
+
 export function jsonResult(payload: unknown): AgentToolResult<unknown> {
+  let text = JSON.stringify(payload, null, 2);
+  text = stripLoneSurrogates(text);
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify(payload, null, 2),
+        text,
       },
     ],
     details: payload,

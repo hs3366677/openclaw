@@ -1303,6 +1303,13 @@ export async function runEmbeddedPiAgent(
               agentDir: params.agentDir,
             });
           }
+          // Surface LLM-level errors (e.g. "Bad Unicode escape in JSON") in meta
+          // so the auto-retry mechanism in agent-runner can pick them up.
+          const assistantLevelError =
+            lastAssistant?.stopReason === "error" && assistantErrorText
+              ? { kind: "unhandled" as const, message: assistantErrorText }
+              : undefined;
+
           return {
             payloads: payloads.length ? payloads : undefined,
             meta: {
@@ -1310,6 +1317,7 @@ export async function runEmbeddedPiAgent(
               agentMeta,
               aborted,
               systemPromptReport: attempt.systemPromptReport,
+              error: assistantLevelError,
               // Handle client tool calls (OpenResponses hosted tools)
               // Propagate the LLM stop reason so callers (lifecycle events,
               // ACP bridge) can distinguish end_turn from max_tokens.
@@ -1333,6 +1341,32 @@ export async function runEmbeddedPiAgent(
             successfulCronAdds: attempt.successfulCronAdds,
           };
         }
+      } catch (err) {
+        const errorMessage =
+          err instanceof Error ? err.message : String(err);
+        log.error(
+          `[run-unhandled-error] sessionKey=${params.sessionKey ?? params.sessionId} ` +
+            `provider=${provider}/${modelId} error=${errorMessage}`,
+        );
+        return {
+          payloads: [
+            {
+              text:
+                `Agent encountered an unexpected error: ${errorMessage}\n\n` +
+                "Please try again, or use /new to start a fresh session.",
+              isError: true,
+            },
+          ],
+          meta: {
+            durationMs: Date.now() - started,
+            agentMeta: {
+              sessionId: params.sessionId,
+              provider,
+              model: modelId,
+            },
+            error: { kind: "unhandled", message: errorMessage },
+          },
+        };
       } finally {
         stopCopilotRefreshTimer();
         process.chdir(prevCwd);

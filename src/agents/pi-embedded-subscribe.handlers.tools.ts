@@ -166,6 +166,10 @@ function emitToolResultOutput(params: {
 
   // emitToolOutput() already handles MEDIA: directives when enabled; this path
   // only sends raw media URLs for non-verbose delivery mode.
+  // Suppress browser screenshots — they are intermediate artifacts, not user-facing results.
+  if (toolName === "browser") {
+    return;
+  }
   const mediaPaths = filterToolResultMediaUrls(toolName, extractToolResultMediaPaths(result));
   if (mediaPaths.length === 0) {
     return;

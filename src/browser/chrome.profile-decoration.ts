@@ -194,5 +194,8 @@ export function ensureProfileCleanExit(userDataDir: string) {
   const prefs = safeReadJson(preferencesPath) ?? {};
   setDeep(prefs, ["exit_type"], "Normal");
   setDeep(prefs, ["exited_cleanly"], true);
+  // Prevent Chrome from restoring the previous session's tabs on startup.
+  // 5 = open New Tab page; avoids re-visiting the last page.
+  setDeep(prefs, ["session", "restore_on_startup"], 5);
   safeWriteJson(preferencesPath, prefs);
 }

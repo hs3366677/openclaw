@@ -68,7 +68,7 @@ export type AgentRunLoopResult =
       /** Payload keys sent directly (not via pipeline) during tool flush. */
       directlySentBlockKeys?: Set<string>;
     }
-  | { kind: "final"; payload: ReplyPayload };
+  | { kind: "final"; payload: ReplyPayload; retryable?: boolean };
 
 export async function runAgentTurnWithFallback(params: {
   commandBody: string;
@@ -478,6 +478,7 @@ export async function runAgentTurnWithFallback(params: {
         didResetAfterCompactionFailure = true;
         return {
           kind: "final",
+          retryable: true,
           payload: {
             text: "⚠️ Context limit exceeded. I've reset our conversation to start fresh - please try again.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.",
           },
@@ -488,6 +489,7 @@ export async function runAgentTurnWithFallback(params: {
         if (didReset) {
           return {
             kind: "final",
+            retryable: true,
             payload: {
               text: "⚠️ Message ordering conflict. I've reset the conversation - please try again.",
             },
@@ -512,6 +514,7 @@ export async function runAgentTurnWithFallback(params: {
         didResetAfterCompactionFailure = true;
         return {
           kind: "final",
+          retryable: true,
           payload: {
             text: "⚠️ Context limit exceeded during compaction. I've reset our conversation to start fresh - please try again.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.",
           },
@@ -522,6 +525,7 @@ export async function runAgentTurnWithFallback(params: {
         if (didReset) {
           return {
             kind: "final",
+            retryable: true,
             payload: {
               text: "⚠️ Message ordering conflict. I've reset the conversation - please try again.",
             },
@@ -568,6 +572,7 @@ export async function runAgentTurnWithFallback(params: {
 
         return {
           kind: "final",
+          retryable: true,
           payload: {
             text: "⚠️ Session history was corrupted. I've reset the conversation - please try again!",
           },
@@ -600,8 +605,11 @@ export async function runAgentTurnWithFallback(params: {
           ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
           : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
 
+      // Non-overflow errors are potentially retryable (e.g. transient API failures).
+      const isRetryableError = !isContextOverflow;
       return {
         kind: "final",
+        retryable: isRetryableError,
         payload: {
           text: fallbackText,
         },
