@@ -63,7 +63,7 @@ const CORE_TOOL_DEFINITIONS: CoreToolDefinition[] = [
   {
     id: "apply_patch",
     label: "apply_patch",
-    description: "Patch files (OpenAI)",
+    description: "Patch files",
     sectionId: "fs",
     profiles: ["coding"],
   },
@@ -146,6 +146,14 @@ const CORE_TOOL_DEFINITIONS: CoreToolDefinition[] = [
     includeInOpenClawGroup: true,
   },
   {
+    id: "sessions_yield",
+    label: "sessions_yield",
+    description: "End turn to receive sub-agent results",
+    sectionId: "sessions",
+    profiles: ["coding"],
+    includeInOpenClawGroup: true,
+  },
+  {
     id: "subagents",
     label: "subagents",
     description: "Manage sub-agents",
@@ -221,6 +229,14 @@ const CORE_TOOL_DEFINITIONS: CoreToolDefinition[] = [
     id: "image",
     label: "image",
     description: "Image understanding",
+    sectionId: "media",
+    profiles: ["coding"],
+    includeInOpenClawGroup: true,
+  },
+  {
+    id: "image_generate",
+    label: "image_generate",
+    description: "Image generation",
     sectionId: "media",
     profiles: ["coding"],
     includeInOpenClawGroup: true,

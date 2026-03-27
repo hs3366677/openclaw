@@ -23,15 +23,15 @@
 
 import { randomUUID } from "node:crypto";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
+import * as piAi from "@mariozechner/pi-ai";
 import type {
   AssistantMessage,
+  AssistantMessageEvent,
+  AssistantMessageEventStream,
   Context,
   Message,
   StopReason,
-  TextContent,
-  ToolCall,
 } from "@mariozechner/pi-ai";
-import { createAssistantMessageEventStream, streamSimple } from "@mariozechner/pi-ai";
 import {
   OpenAIWebSocketManager,
   type ContentPart,
@@ -68,6 +68,98 @@ interface WsSession {
 /** Module-level registry: sessionId → WsSession */
 const wsRegistry = new Map<string, WsSession>();
 
+type OpenAIWsStreamDeps = {
+  createManager: (options?: OpenAIWebSocketManagerOptions) => OpenAIWebSocketManager;
+  streamSimple: typeof piAi.streamSimple;
+};
+
+const defaultOpenAIWsStreamDeps: OpenAIWsStreamDeps = {
+  createManager: (options) => new OpenAIWebSocketManager(options),
+  streamSimple: (...args) => piAi.streamSimple(...args),
+};
+
+let openAIWsStreamDeps: OpenAIWsStreamDeps = defaultOpenAIWsStreamDeps;
+
+type AssistantMessageEventStreamLike = {
+  push(event: AssistantMessageEvent): void;
+  end(result?: AssistantMessage): void;
+  result(): Promise<AssistantMessage>;
+  [Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent>;
+};
+
+class LocalAssistantMessageEventStream implements AssistantMessageEventStreamLike {
+  private readonly queue: AssistantMessageEvent[] = [];
+  private readonly waiting: Array<(value: IteratorResult<AssistantMessageEvent>) => void> = [];
+  private done = false;
+  private readonly finalResultPromise: Promise<AssistantMessage>;
+  private resolveFinalResult!: (result: AssistantMessage) => void;
+
+  constructor() {
+    this.finalResultPromise = new Promise((resolve) => {
+      this.resolveFinalResult = resolve;
+    });
+  }
+
+  push(event: AssistantMessageEvent): void {
+    if (this.done) {
+      return;
+    }
+    if (event.type === "done") {
+      this.done = true;
+      this.resolveFinalResult(event.message);
+    } else if (event.type === "error") {
+      this.done = true;
+      this.resolveFinalResult(event.error);
+    }
+    const waiter = this.waiting.shift();
+    if (waiter) {
+      waiter({ value: event, done: false });
+      return;
+    }
+    this.queue.push(event);
+  }
+
+  end(result?: AssistantMessage): void {
+    this.done = true;
+    if (result) {
+      this.resolveFinalResult(result);
+    }
+    while (this.waiting.length > 0) {
+      const waiter = this.waiting.shift();
+      waiter?.({ value: undefined as unknown as AssistantMessageEvent, done: true });
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent> {
+    while (true) {
+      if (this.queue.length > 0) {
+        yield this.queue.shift()!;
+        continue;
+      }
+      if (this.done) {
+        return;
+      }
+      const result = await new Promise<IteratorResult<AssistantMessageEvent>>((resolve) => {
+        this.waiting.push(resolve);
+      });
+      if (result.done) {
+        return;
+      }
+      yield result.value;
+    }
+  }
+
+  result(): Promise<AssistantMessage> {
+    return this.finalResultPromise;
+  }
+}
+
+function createEventStream(): AssistantMessageEventStream {
+  return typeof piAi.createAssistantMessageEventStream === "function"
+    ? piAi.createAssistantMessageEventStream()
+    : (new LocalAssistantMessageEventStream() as unknown as AssistantMessageEventStream);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public registry helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +194,18 @@ export function hasWsSession(sessionId: string): boolean {
 
 type AnyMessage = Message & { role: string; content: unknown };
 type AssistantMessageWithPhase = AssistantMessage & { phase?: OpenAIResponsesAssistantPhase };
+type ReplayModelInfo = { input?: ReadonlyArray<string> };
+type ReplayableReasoningItem = Extract<InputItem, { type: "reasoning" }>;
+type ReplayableReasoningSignature = {
+  type: "reasoning" | `reasoning.${string}`;
+  id?: string;
+};
+type ToolCallReplayId = { callId: string; itemId?: string };
+type PlannedTurnInput = {
+  inputItems: InputItem[];
+  previousResponseId?: string;
+  mode: "incremental_tool_results" | "full_context_initial" | "full_context_restart";
+};
 
 function toNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") {
@@ -115,6 +219,46 @@ function normalizeAssistantPhase(value: unknown): OpenAIResponsesAssistantPhase 
   return value === "commentary" || value === "final_answer" ? value : undefined;
 }
 
+function encodeAssistantTextSignature(params: {
+  id: string;
+  phase?: OpenAIResponsesAssistantPhase;
+}): string {
+  return JSON.stringify({
+    v: 1,
+    id: params.id,
+    ...(params.phase ? { phase: params.phase } : {}),
+  });
+}
+
+function parseAssistantTextSignature(
+  value: unknown,
+): { id: string; phase?: OpenAIResponsesAssistantPhase } | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  if (!value.startsWith("{")) {
+    return { id: value };
+  }
+  try {
+    const parsed = JSON.parse(value) as { v?: unknown; id?: unknown; phase?: unknown };
+    if (parsed.v !== 1 || typeof parsed.id !== "string") {
+      return null;
+    }
+    return {
+      id: parsed.id,
+      ...(normalizeAssistantPhase(parsed.phase)
+        ? { phase: normalizeAssistantPhase(parsed.phase) }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function supportsImageInput(modelOverride?: ReplayModelInfo): boolean {
+  return !Array.isArray(modelOverride?.input) || modelOverride.input.includes("image");
+}
+
 /** Convert pi-ai content (string | ContentPart[]) to plain text. */
 function contentToText(content: unknown): string {
   if (typeof content === "string") {
@@ -123,30 +267,50 @@ function contentToText(content: unknown): string {
   if (!Array.isArray(content)) {
     return "";
   }
-  return (content as Array<{ type?: string; text?: string }>)
-    .filter((p) => p.type === "text" && typeof p.text === "string")
-    .map((p) => p.text as string)
+  return content
+    .filter(
+      (part): part is { type?: string; text?: string } => Boolean(part) && typeof part === "object",
+    )
+    .filter(
+      (part) =>
+        (part.type === "text" || part.type === "input_text" || part.type === "output_text") &&
+        typeof part.text === "string",
+    )
+    .map((part) => part.text as string)
     .join("");
 }
 
 /** Convert pi-ai content to OpenAI ContentPart[]. */
-function contentToOpenAIParts(content: unknown): ContentPart[] {
+function contentToOpenAIParts(content: unknown, modelOverride?: ReplayModelInfo): ContentPart[] {
   if (typeof content === "string") {
     return content ? [{ type: "input_text", text: content }] : [];
   }
   if (!Array.isArray(content)) {
     return [];
   }
+
+  const includeImages = supportsImageInput(modelOverride);
   const parts: ContentPart[] = [];
   for (const part of content as Array<{
     type?: string;
     text?: string;
     data?: string;
     mimeType?: string;
+    source?: unknown;
   }>) {
-    if (part.type === "text" && typeof part.text === "string") {
+    if (
+      (part.type === "text" || part.type === "input_text" || part.type === "output_text") &&
+      typeof part.text === "string"
+    ) {
       parts.push({ type: "input_text", text: part.text });
-    } else if (part.type === "image" && typeof part.data === "string") {
+      continue;
+    }
+
+    if (!includeImages) {
+      continue;
+    }
+
+    if (part.type === "image" && typeof part.data === "string") {
       parts.push({
         type: "input_image",
         source: {
@@ -155,9 +319,169 @@ function contentToOpenAIParts(content: unknown): ContentPart[] {
           data: part.data,
         },
       });
+      continue;
+    }
+
+    if (
+      part.type === "input_image" &&
+      part.source &&
+      typeof part.source === "object" &&
+      typeof (part.source as { type?: unknown }).type === "string"
+    ) {
+      parts.push({
+        type: "input_image",
+        source: part.source as
+          | { type: "url"; url: string }
+          | { type: "base64"; media_type: string; data: string },
+      });
     }
   }
   return parts;
+}
+
+function isReplayableReasoningType(value: unknown): value is "reasoning" | `reasoning.${string}` {
+  return typeof value === "string" && (value === "reasoning" || value.startsWith("reasoning."));
+}
+
+function toReplayableReasoningId(value: unknown): string | null {
+  const id = toNonEmptyString(value);
+  return id && id.startsWith("rs_") ? id : null;
+}
+
+function toReasoningSignature(value: unknown): ReplayableReasoningSignature | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as { type?: unknown; id?: unknown };
+  if (!isReplayableReasoningType(record.type)) {
+    return null;
+  }
+  const reasoningId = toReplayableReasoningId(record.id);
+  return {
+    type: record.type,
+    ...(reasoningId ? { id: reasoningId } : {}),
+  };
+}
+
+function encodeThinkingSignature(signature: ReplayableReasoningSignature): string {
+  return JSON.stringify(signature);
+}
+
+function parseReasoningItem(value: unknown): ReplayableReasoningItem | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as {
+    type?: unknown;
+    id?: unknown;
+    content?: unknown;
+    encrypted_content?: unknown;
+    summary?: unknown;
+  };
+  if (!isReplayableReasoningType(record.type)) {
+    return null;
+  }
+  const reasoningId = toReplayableReasoningId(record.id);
+  return {
+    type: "reasoning",
+    ...(reasoningId ? { id: reasoningId } : {}),
+    ...(typeof record.content === "string" ? { content: record.content } : {}),
+    ...(typeof record.encrypted_content === "string"
+      ? { encrypted_content: record.encrypted_content }
+      : {}),
+    ...(typeof record.summary === "string" ? { summary: record.summary } : {}),
+  };
+}
+
+function parseThinkingSignature(value: unknown): ReplayableReasoningItem | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  try {
+    const signature = toReasoningSignature(JSON.parse(value));
+    return signature ? parseReasoningItem(signature) : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodeToolCallReplayId(params: ToolCallReplayId): string {
+  return params.itemId ? `${params.callId}|${params.itemId}` : params.callId;
+}
+
+function decodeToolCallReplayId(value: unknown): ToolCallReplayId | null {
+  const raw = toNonEmptyString(value);
+  if (!raw) {
+    return null;
+  }
+  const [callId, itemId] = raw.split("|", 2);
+  return {
+    callId,
+    ...(itemId ? { itemId } : {}),
+  };
+}
+
+function extractReasoningSummaryText(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (!Array.isArray(value)) {
+    return "";
+  }
+  return value
+    .map((item) => {
+      if (typeof item === "string") {
+        return item.trim();
+      }
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const record = item as { text?: unknown };
+      return typeof record.text === "string" ? record.text.trim() : "";
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function extractResponseReasoningText(item: unknown): string {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+  const record = item as { summary?: unknown; content?: unknown };
+  const summaryText = extractReasoningSummaryText(record.summary);
+  if (summaryText) {
+    return summaryText;
+  }
+  return typeof record.content === "string" ? record.content.trim() : "";
+}
+
+function planTurnInput(params: {
+  context: Context;
+  model: ReplayModelInfo;
+  previousResponseId: string | null;
+  lastContextLength: number;
+}): PlannedTurnInput {
+  if (params.previousResponseId && params.lastContextLength > 0) {
+    const newMessages = params.context.messages.slice(params.lastContextLength);
+    const toolResults = newMessages.filter((m) => (m as AnyMessage).role === "toolResult");
+    if (toolResults.length > 0) {
+      return {
+        mode: "incremental_tool_results",
+        previousResponseId: params.previousResponseId,
+        inputItems: convertMessagesToInputItems(toolResults, params.model),
+      };
+    }
+    return {
+      mode: "full_context_restart",
+      inputItems: buildFullInput(params.context, params.model),
+    };
+  }
+
+  return {
+    mode: "full_context_initial",
+    inputItems: buildFullInput(params.context, params.model),
+  };
 }
 
 /** Convert pi-ai tool array to OpenAI FunctionToolDefinition[]. */
@@ -167,11 +491,9 @@ export function convertTools(tools: Context["tools"]): FunctionToolDefinition[] 
   }
   return tools.map((tool) => ({
     type: "function" as const,
-    function: {
-      name: tool.name,
-      description: typeof tool.description === "string" ? tool.description : undefined,
-      parameters: (tool.parameters ?? {}) as Record<string, unknown>,
-    },
+    name: tool.name,
+    description: typeof tool.description === "string" ? tool.description : undefined,
+    parameters: (tool.parameters ?? {}) as Record<string, unknown>,
   }));
 }
 
@@ -179,14 +501,24 @@ export function convertTools(tools: Context["tools"]): FunctionToolDefinition[] 
  * Convert the full pi-ai message history to an OpenAI `input` array.
  * Handles user messages, assistant text+tool-call messages, and tool results.
  */
-export function convertMessagesToInputItems(messages: Message[]): InputItem[] {
+export function convertMessagesToInputItems(
+  messages: Message[],
+  modelOverride?: ReplayModelInfo,
+): InputItem[] {
   const items: InputItem[] = [];
 
   for (const msg of messages) {
-    const m = msg as AnyMessage;
+    const m = msg as AnyMessage & {
+      phase?: unknown;
+      toolCallId?: unknown;
+      toolUseId?: unknown;
+    };
 
     if (m.role === "user") {
-      const parts = contentToOpenAIParts(m.content);
+      const parts = contentToOpenAIParts(m.content, modelOverride);
+      if (parts.length === 0) {
+        continue;
+      }
       items.push({
         type: "message",
         role: "user",
@@ -199,91 +531,118 @@ export function convertMessagesToInputItems(messages: Message[]): InputItem[] {
     }
 
     if (m.role === "assistant") {
-      const assistantPhase = normalizeAssistantPhase((m as { phase?: unknown }).phase);
       const content = m.content;
+      let assistantPhase = normalizeAssistantPhase(m.phase);
       if (Array.isArray(content)) {
-        // Collect text blocks and tool calls separately
         const textParts: string[] = [];
-        for (const block of content as Array<{
-          type?: string;
-          text?: string;
-          id?: string;
-          name?: string;
-          arguments?: Record<string, unknown>;
-          thinking?: string;
-        }>) {
-          if (block.type === "text" && typeof block.text === "string") {
-            textParts.push(block.text);
-          } else if (block.type === "thinking" && typeof block.thinking === "string") {
-            // Skip thinking blocks — not sent back to the model
-          } else if (block.type === "toolCall") {
-            // Push accumulated text first
-            if (textParts.length > 0) {
-              items.push({
-                type: "message",
-                role: "assistant",
-                content: textParts.join(""),
-                ...(assistantPhase ? { phase: assistantPhase } : {}),
-              });
-              textParts.length = 0;
-            }
-            const callId = toNonEmptyString(block.id);
-            const toolName = toNonEmptyString(block.name);
-            if (!callId || !toolName) {
-              continue;
-            }
-            // Push function_call item
-            items.push({
-              type: "function_call",
-              call_id: callId,
-              name: toolName,
-              arguments:
-                typeof block.arguments === "string"
-                  ? block.arguments
-                  : JSON.stringify(block.arguments ?? {}),
-            });
+        const pushAssistantText = () => {
+          if (textParts.length === 0) {
+            return;
           }
-        }
-        if (textParts.length > 0) {
           items.push({
             type: "message",
             role: "assistant",
             content: textParts.join(""),
             ...(assistantPhase ? { phase: assistantPhase } : {}),
           });
-        }
-      } else {
-        const text = contentToText(m.content);
-        if (text) {
+          textParts.length = 0;
+        };
+
+        for (const block of content as Array<{
+          type?: string;
+          text?: string;
+          textSignature?: unknown;
+          id?: unknown;
+          name?: unknown;
+          arguments?: unknown;
+          thinkingSignature?: unknown;
+        }>) {
+          if (block.type === "text" && typeof block.text === "string") {
+            const parsedSignature = parseAssistantTextSignature(block.textSignature);
+            if (!assistantPhase) {
+              assistantPhase = parsedSignature?.phase;
+            }
+            textParts.push(block.text);
+            continue;
+          }
+
+          if (block.type === "thinking") {
+            pushAssistantText();
+            const reasoningItem = parseThinkingSignature(block.thinkingSignature);
+            if (reasoningItem) {
+              items.push(reasoningItem);
+            }
+            continue;
+          }
+
+          if (block.type !== "toolCall") {
+            continue;
+          }
+
+          pushAssistantText();
+          const replayId = decodeToolCallReplayId(block.id);
+          const toolName = toNonEmptyString(block.name);
+          if (!replayId || !toolName) {
+            continue;
+          }
           items.push({
-            type: "message",
-            role: "assistant",
-            content: text,
-            ...(assistantPhase ? { phase: assistantPhase } : {}),
+            type: "function_call",
+            ...(replayId.itemId ? { id: replayId.itemId } : {}),
+            call_id: replayId.callId,
+            name: toolName,
+            arguments:
+              typeof block.arguments === "string"
+                ? block.arguments
+                : JSON.stringify(block.arguments ?? {}),
           });
         }
+
+        pushAssistantText();
+        continue;
       }
+
+      const text = contentToText(content);
+      if (!text) {
+        continue;
+      }
+      items.push({
+        type: "message",
+        role: "assistant",
+        content: text,
+        ...(assistantPhase ? { phase: assistantPhase } : {}),
+      });
       continue;
     }
 
-    if (m.role === "toolResult") {
-      const tr = m as unknown as {
-        toolCallId?: string;
-        toolUseId?: string;
-        content: unknown;
-        isError: boolean;
-      };
-      const callId = toNonEmptyString(tr.toolCallId) ?? toNonEmptyString(tr.toolUseId);
-      if (!callId) {
-        continue;
-      }
-      const outputText = contentToText(tr.content);
-      items.push({
-        type: "function_call_output",
-        call_id: callId,
-        output: outputText,
-      });
+    if (m.role !== "toolResult") {
       continue;
+    }
+
+    const toolCallId = toNonEmptyString(m.toolCallId) ?? toNonEmptyString(m.toolUseId);
+    if (!toolCallId) {
+      continue;
+    }
+    const replayId = decodeToolCallReplayId(toolCallId);
+    if (!replayId) {
+      continue;
+    }
+    const parts = Array.isArray(m.content) ? contentToOpenAIParts(m.content, modelOverride) : [];
+    const textOutput = contentToText(m.content);
+    const imageParts = parts.filter((part) => part.type === "input_image");
+    items.push({
+      type: "function_call_output",
+      call_id: replayId.callId,
+      output: textOutput || (imageParts.length > 0 ? "(see attached image)" : ""),
+    });
+    if (imageParts.length > 0) {
+      items.push({
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "Attached image(s) from tool result:" },
+          ...imageParts,
+        ],
+      });
     }
   }
 
@@ -298,7 +657,7 @@ export function buildAssistantMessageFromResponse(
   response: ResponseObject,
   modelInfo: { api: string; provider: string; id: string },
 ): AssistantMessage {
-  const content: (TextContent | ToolCall)[] = [];
+  const content: AssistantMessage["content"] = [];
   let assistantPhase: OpenAIResponsesAssistantPhase | undefined;
 
   for (const item of response.output ?? []) {
@@ -309,7 +668,14 @@ export function buildAssistantMessageFromResponse(
       }
       for (const part of item.content ?? []) {
         if (part.type === "output_text" && part.text) {
-          content.push({ type: "text", text: part.text });
+          content.push({
+            type: "text",
+            text: part.text,
+            textSignature: encodeAssistantTextSignature({
+              id: item.id,
+              ...(itemPhase ? { phase: itemPhase } : {}),
+            }),
+          });
         }
       }
     } else if (item.type === "function_call") {
@@ -317,9 +683,14 @@ export function buildAssistantMessageFromResponse(
       if (!toolName) {
         continue;
       }
+      const callId = toNonEmptyString(item.call_id);
+      const itemId = toNonEmptyString(item.id);
       content.push({
         type: "toolCall",
-        id: toNonEmptyString(item.call_id) ?? `call_${randomUUID()}`,
+        id: encodeToolCallReplayId({
+          callId: callId ?? `call_${randomUUID()}`,
+          itemId: itemId ?? undefined,
+        }),
         name: toolName,
         arguments: (() => {
           try {
@@ -329,8 +700,28 @@ export function buildAssistantMessageFromResponse(
           }
         })(),
       });
+    } else {
+      if (!isReplayableReasoningType(item.type)) {
+        continue;
+      }
+      const reasoning = extractResponseReasoningText(item);
+      if (!reasoning) {
+        continue;
+      }
+      const reasoningId = toReplayableReasoningId(item.id);
+      content.push({
+        type: "thinking",
+        thinking: reasoning,
+        ...(reasoningId
+          ? {
+              thinkingSignature: encodeThinkingSignature({
+                id: reasoningId,
+                type: item.type,
+              }),
+            }
+          : {}),
+      } as AssistantMessage["content"][number]);
     }
-    // "reasoning" items are informational only; skip.
   }
 
   const hasToolCalls = content.some((c) => c.type === "toolCall");
@@ -454,7 +845,7 @@ export function createOpenAIWebSocketStreamFn(
   opts: OpenAIWebSocketStreamOptions = {},
 ): StreamFn {
   return (model, context, options) => {
-    const eventStream = createAssistantMessageEventStream();
+    const eventStream = createEventStream();
 
     const run = async () => {
       const transport = resolveWsTransport(options);
@@ -466,7 +857,7 @@ export function createOpenAIWebSocketStreamFn(
       let session = wsRegistry.get(sessionId);
 
       if (!session) {
-        const manager = new OpenAIWebSocketManager(opts.managerOptions);
+        const manager = openAIWsStreamDeps.createManager(opts.managerOptions);
         session = {
           manager,
           lastContextLength: 0,
@@ -523,6 +914,7 @@ export function createOpenAIWebSocketStreamFn(
 
       if (resolveWsWarmup(options) && !session.warmUpAttempted) {
         session.warmUpAttempted = true;
+        let warmupFailed = false;
         try {
           await runWarmUp({
             manager: session.manager,
@@ -536,38 +928,56 @@ export function createOpenAIWebSocketStreamFn(
           if (signal?.aborted) {
             throw warmErr instanceof Error ? warmErr : new Error(String(warmErr));
           }
+          warmupFailed = true;
           log.warn(
             `[ws-stream] warm-up failed for session=${sessionId}; continuing without warm-up. error=${String(warmErr)}`,
           );
         }
+        if (warmupFailed && !session.manager.isConnected()) {
+          try {
+            session.manager.close();
+          } catch {
+            /* ignore */
+          }
+          try {
+            await session.manager.connect(apiKey);
+            session.everConnected = true;
+            log.debug(`[ws-stream] reconnected after warm-up failure for session=${sessionId}`);
+          } catch (reconnectErr) {
+            session.broken = true;
+            wsRegistry.delete(sessionId);
+            if (transport === "websocket") {
+              throw reconnectErr instanceof Error ? reconnectErr : new Error(String(reconnectErr));
+            }
+            log.warn(
+              `[ws-stream] reconnect after warm-up failed for session=${sessionId}; falling back to HTTP. error=${String(reconnectErr)}`,
+            );
+            return fallbackToHttp(model, context, options, eventStream, opts.signal);
+          }
+        }
       }
 
       // ── 3. Compute incremental vs full input ─────────────────────────────
-      const prevResponseId = session.manager.previousResponseId;
-      let inputItems: InputItem[];
+      const turnInput = planTurnInput({
+        context,
+        model,
+        previousResponseId: session.manager.previousResponseId,
+        lastContextLength: session.lastContextLength,
+      });
 
-      if (prevResponseId && session.lastContextLength > 0) {
-        // Subsequent turn: only send new messages (tool results) since last call
-        const newMessages = context.messages.slice(session.lastContextLength);
-        // Filter to only tool results — the assistant message is already in server context
-        const toolResults = newMessages.filter((m) => (m as AnyMessage).role === "toolResult");
-        if (toolResults.length === 0) {
-          // Shouldn't happen in a well-formed turn, but fall back to full context
-          log.debug(
-            `[ws-stream] session=${sessionId}: no new tool results found; sending full context`,
-          );
-          inputItems = buildFullInput(context);
-        } else {
-          inputItems = convertMessagesToInputItems(toolResults);
-        }
+      if (turnInput.mode === "incremental_tool_results") {
         log.debug(
-          `[ws-stream] session=${sessionId}: incremental send (${inputItems.length} tool results) previous_response_id=${prevResponseId}`,
+          `[ws-stream] session=${sessionId}: incremental send (${turnInput.inputItems.length} tool results) previous_response_id=${turnInput.previousResponseId}`,
+        );
+      } else if (turnInput.mode === "full_context_restart") {
+        // The WebSocket guide requires a fresh full-context turn here: when we
+        // cannot continue the incremental chain, omit previous_response_id.
+        log.debug(
+          `[ws-stream] session=${sessionId}: no new tool results found; sending full context without previous_response_id`,
         );
       } else {
-        // First turn: send full context
-        inputItems = buildFullInput(context);
         log.debug(
-          `[ws-stream] session=${sessionId}: full context send (${inputItems.length} items)`,
+          `[ws-stream] session=${sessionId}: full context send (${turnInput.inputItems.length} items)`,
         );
       }
 
@@ -617,13 +1027,15 @@ export function createOpenAIWebSocketStreamFn(
         type: "response.create",
         model: model.id,
         ...(supportsStore !== false ? { store: false } : {}),
-        input: inputItems,
+        input: turnInput.inputItems,
         instructions: context.systemPrompt ?? undefined,
         tools: tools.length > 0 ? tools : undefined,
-        ...(prevResponseId ? { previous_response_id: prevResponseId } : {}),
+        ...(turnInput.previousResponseId
+          ? { previous_response_id: turnInput.previousResponseId }
+          : {}),
         ...extraParams,
       };
-      const nextPayload = await options?.onPayload?.(payload, model);
+      const nextPayload = options?.onPayload?.(payload, model);
       const requestPayload = (nextPayload ?? payload) as Parameters<
         OpenAIWebSocketManager["send"]
       >[0];
@@ -752,8 +1164,8 @@ export function createOpenAIWebSocketStreamFn(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Build full input items from context (system prompt is passed via `instructions` field). */
-function buildFullInput(context: Context): InputItem[] {
-  return convertMessagesToInputItems(context.messages);
+function buildFullInput(context: Context, model: ReplayModelInfo): InputItem[] {
+  return convertMessagesToInputItems(context.messages, model);
 }
 
 /**
@@ -764,12 +1176,23 @@ async function fallbackToHttp(
   model: Parameters<StreamFn>[0],
   context: Parameters<StreamFn>[1],
   options: Parameters<StreamFn>[2],
-  eventStream: ReturnType<typeof createAssistantMessageEventStream>,
+  eventStream: AssistantMessageEventStreamLike,
   signal?: AbortSignal,
 ): Promise<void> {
   const mergedOptions = signal ? { ...options, signal } : options;
-  const httpStream = streamSimple(model, context, mergedOptions);
+  const httpStream = openAIWsStreamDeps.streamSimple(model, context, mergedOptions);
   for await (const event of httpStream) {
     eventStream.push(event);
   }
 }
+
+export const __testing = {
+  setDepsForTest(overrides?: Partial<OpenAIWsStreamDeps>) {
+    openAIWsStreamDeps = overrides
+      ? {
+          ...defaultOpenAIWsStreamDeps,
+          ...overrides,
+        }
+      : defaultOpenAIWsStreamDeps;
+  },
+};
